@@ -98,6 +98,8 @@ int LocationService::stop() {
 int LocationService::getLocation(LocationPoint& point) {
     WITH_LOCK(*gps_) {
         point.locked = (gps_->getLock()) ? 1 : 0;
+        point.stable = gps_->isLockStable();
+        point.lockedDuration = gps_->getLockDuration();
         point.epochTime = (time_t)gps_->getUTCTime();
         point.timeScale = LocationTimescale::TIMESCALE_UTC;
         if (point.locked) {

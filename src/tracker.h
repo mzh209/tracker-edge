@@ -27,6 +27,7 @@
 #include "motion_service.h"
 #include "AM1805.h"
 
+#include "tracker_sleep.h"
 #include "tracker_location.h"
 #include "tracker_motion.h"
 #include "tracker_shipping.h"
@@ -62,6 +63,8 @@ class Tracker
 
         bool isUsbCommandEnabled() { return _config.UsbCommandEnable; }
 
+        void enableWatchdog(bool enable);
+
         // underlying services exposed to allow sharing with rest of the system
         CloudService &cloudService;
         ConfigService &configService;
@@ -85,6 +88,12 @@ class Tracker
 
         uint32_t last_loop_sec;
 
+        uint8_t canRead(const uint8_t address);
+        void canModify(const uint8_t address, const uint8_t mask, const uint8_t data);
+        void initIo();
+        void onSleepPrepare(TrackerSleepContext context);
+        void onSleep(TrackerSleepContext context);
+        void onWake(TrackerSleepContext context);
         int registerConfig();
         static void loc_gen_cb(JSONWriter& writer, LocationPoint &loc, const void *context);
 };

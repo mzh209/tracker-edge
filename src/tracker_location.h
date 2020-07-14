@@ -20,11 +20,20 @@
 #include "cloud_service.h"
 #include "location_service.h"
 #include "motion_service.h"
+#include "tracker_sleep.h"
 
 #define TRACKER_LOCATION_INTERVAL_MIN_DEFAULT_SEC (900)
 #define TRACKER_LOCATION_INTERVAL_MAX_DEFAULT_SEC (3600)
 #define TRACKER_LOCATION_MIN_PUBLISH_DEFAULT (false)
 #define TRACKER_LOCATION_LOCK_TRIGGER (true)
+
+// wait at most this many seconds for a locked GPS location to become stable
+// before publishing regardless
+#define TRACKER_LOCATION_STABLE_WAIT_MAX (30)
+
+// wait at most this many seconds for initial lock on boot before publishing
+// regardless
+#define TRACKER_LOCATION_INITIAL_LOCK_MAX (90)
 
 struct tracker_location_config_t {
     int32_t interval_min_seconds; // 0 = no min
@@ -36,6 +45,26 @@ struct tracker_location_config_t {
 enum class Trigger {
     NORMAL = 0,
     IMMEDIATE = 1,
+};
+
+enum class GnssState {
+    OFF,
+    ERROR,
+    ON_UNLOCKED,
+    ON_LOCKED_UNSTABLE,
+    ON_LOCKED_STABLE,
+};
+
+enum class PublishReason {
+    NONE,
+    TIME,
+    TRIGGERS,
+    IMMEDIATE,
+};
+
+struct EvaluationResults {
+    PublishReason reason;
+    bool networkNeeded;
 };
 
 class TrackerLocation
@@ -74,7 +103,7 @@ class TrackerLocation
         // register for callback on location publish success/fail
         // these callbacks are NOT persistent and are used for the next publish
         int regLocPubCallback(
-            cloud_service_send_cb_t cb, 
+            cloud_service_send_cb_t cb,
             const void *context=nullptr);
 
         template <typename T>
@@ -92,6 +121,8 @@ class TrackerLocation
 
     private:
         TrackerLocation() :
+            _pending_immediate(false),
+            _first_publish(true),
             location_publish_retry_str(nullptr)
         {
             config_state = {
@@ -105,8 +136,9 @@ class TrackerLocation
 
         std::recursive_mutex mutex;
 
-        Vector<const char *> pending_triggers;
-        bool pending_immediate;
+        Vector<const char *> _pending_triggers;
+        bool _pending_immediate;
+        bool _first_publish;
 
         char *location_publish_retry_str;
 
@@ -121,7 +153,19 @@ class TrackerLocation
 
         void location_publish();
 
-        uint32_t last_location_publish_sec;
+        bool isSleepEnabled();
+        void enableNetwork();
+        void disableNetwork();
+        void onSleepPrepare(TrackerSleepContext context);
+        void onSleep(TrackerSleepContext context);
+        void onSleepCancel(TrackerSleepContext context);
+        void onWake(TrackerSleepContext context);
+        void onSleepState(TrackerSleepContext context);
+        EvaluationResults evaluatePublish(uint32_t allowance = 0);
+        void buildPublish(LocationPoint& cur_loc);
+        GnssState loopLocation(LocationPoint& cur_loc);
+
+        uint32_t _last_location_publish_sec;
 
         tracker_location_config_t config_state, config_state_shadow;
 

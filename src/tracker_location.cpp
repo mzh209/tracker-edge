@@ -107,7 +107,13 @@ void TrackerLocation::init()
 
     CloudService::instance().regCommandCallback("get_loc", &TrackerLocation::get_loc_cb, this);
 
-    last_location_publish_sec = System.uptime() - config_state.interval_min_seconds;
+    _last_location_publish_sec = System.uptime() - config_state.interval_min_seconds;
+
+    TrackerSleep::instance().registerSleepPrepare([this](TrackerSleepContext context){ this->onSleepPrepare(context); });
+    TrackerSleep::instance().registerSleep([this](TrackerSleepContext context){ this->onSleep(context); });
+    TrackerSleep::instance().registerSleepCancel([this](TrackerSleepContext context){ this->onSleepCancel(context); });
+    TrackerSleep::instance().registerWake([this](TrackerSleepContext context){ this->onWake(context); });
+    TrackerSleep::instance().registerStateChange([this](TrackerSleepContext context){ this->onSleepState(context); });
 }
 
 int TrackerLocation::regLocGenCallback(
@@ -121,7 +127,7 @@ int TrackerLocation::regLocGenCallback(
 // register for callback on location publish success/fail
 // these callbacks are NOT persistent and are used for the next publish
 int TrackerLocation::regLocPubCallback(
-    cloud_service_send_cb_t cb, 
+    cloud_service_send_cb_t cb,
     const void *context)
 {
     locPubCallbacks.append(std::bind(cb, _1, _2, _3, context));
@@ -133,7 +139,7 @@ int TrackerLocation::triggerLocPub(Trigger type, const char *s)
     std::lock_guard<std::recursive_mutex> lg(mutex);
     bool matched = false;
 
-    for(auto trigger : pending_triggers)
+    for(auto trigger : _pending_triggers)
     {
         if(!strcmp(trigger, s))
         {
@@ -141,15 +147,15 @@ int TrackerLocation::triggerLocPub(Trigger type, const char *s)
             break;
         }
     }
-    
+
     if(!matched)
     {
-        pending_triggers.append(s);
+        _pending_triggers.append(s);
     }
 
     if(type == Trigger::IMMEDIATE)
     {
-        pending_immediate = true;
+        _pending_immediate = true;
     }
 
     return 0;
@@ -173,13 +179,14 @@ int TrackerLocation::location_publish_cb(CloudServiceStatus status, JSONValue *r
         // this could either be on the Particle Cloud ack (default) OR the
         // end-to-end ACK
         Log.info("location cb publish %lu success!", *(uint32_t *) context);
+        _first_publish = false;
     }
     else if(status == CloudServiceStatus::FAILURE)
     {
         // right now FAILURE only comes out of a Particle Cloud issue
         // once Particle Cloud passes if waiting on end-to-end it will
         // only ever timeout
-        
+
         // save on failure for retry
         if(req_event && !location_publish_retry_str)
         {
@@ -227,7 +234,7 @@ void TrackerLocation::location_publish()
             WITH_ACK,
             CloudServicePublishFlags::FULL_ACK,
             &TrackerLocation::location_publish_cb, this,
-            CLOUD_DEFAULT_TIMEOUT_MS, &last_location_publish_sec);
+            CLOUD_DEFAULT_TIMEOUT_MS, &_last_location_publish_sec);
     }
     else
     {
@@ -235,7 +242,7 @@ void TrackerLocation::location_publish()
         rval = cloud_service.send(WITH_ACK,
             CloudServicePublishFlags::FULL_ACK,
             &TrackerLocation::location_publish_cb, this,
-            CLOUD_DEFAULT_TIMEOUT_MS, &last_location_publish_sec);
+            CLOUD_DEFAULT_TIMEOUT_MS, &_last_location_publish_sec);
     }
 
     if(rval == -EBUSY)
@@ -276,74 +283,292 @@ void TrackerLocation::location_publish()
     cloud_service.unlock();
 }
 
-void TrackerLocation::loop()
-{
+void TrackerLocation::enableNetwork() {
+    LocationService::instance().start();
+    TrackerSleep::instance().forceFullWakeCycle();
+}
+
+void TrackerLocation::disableNetwork() {
+    LocationService::instance().stop();
+}
+
+EvaluationResults TrackerLocation::evaluatePublish(uint32_t allowance) {
+    if (_pending_immediate) {
+        // request for immediate publish overrides the default min/max interval checking
+        Log.trace("%s pending_immediate", __FUNCTION__);
+        return EvaluationResults {PublishReason::IMMEDIATE, true};
+    }
+
+    uint32_t interval = System.uptime() - _last_location_publish_sec;
+
+    uint32_t max = ((uint32_t)config_state.interval_max_seconds > allowance) ?
+        ((uint32_t)config_state.interval_max_seconds - allowance) : (uint32_t)config_state.interval_max_seconds;
+
+    if (config_state.interval_max_seconds &&
+        (interval >= max)) {
+        // max interval and past the max interval so have to publish
+        Log.trace("%s max", __FUNCTION__);
+        return EvaluationResults {PublishReason::TIME, true};
+    }
+
+    uint32_t min = ((uint32_t)config_state.interval_min_seconds > allowance) ?
+        ((uint32_t)config_state.interval_min_seconds - allowance) : (uint32_t)config_state.interval_min_seconds;
+
+    if (_pending_triggers.size() &&
+        (!config_state.interval_min_seconds ||
+        (interval >= min))) {
+        // no min interval or past the min interval so can publish
+        Log.trace("%s min", __FUNCTION__);
+        return EvaluationResults {PublishReason::TRIGGERS, true};
+    }
+
+    // This will allow a trigger publish on boot
+    if (_first_publish) {
+        Log.trace("%s first", __FUNCTION__);
+        return EvaluationResults {PublishReason::TRIGGERS, true};
+    }
+
+    return EvaluationResults {PublishReason::NONE, false};
+}
+
+void TrackerLocation::onSleepPrepare(TrackerSleepContext context) {
+    unsigned int wake = _last_location_publish_sec;
+    int32_t interval = 0;
+    if (_pending_triggers.size()) {
+        interval = config_state.interval_min_seconds;
+        wake += interval;
+    }
+    else {
+        interval = config_state.interval_max_seconds;
+        wake += interval;
+    }
+    TrackerSleep::instance().wakeAtSeconds(wake);
+    Log.trace("%s last=%lu, interval=%ld", __FUNCTION__, _last_location_publish_sec, interval);
+}
+
+bool TrackerLocation::isSleepEnabled() {
+    return (TrackerSleep::instance().getConfigMode() != TrackerSleepMode::Disable);
+}
+
+void TrackerLocation::onSleep(TrackerSleepContext context) {
+    disableNetwork();
+}
+
+void TrackerLocation::onSleepCancel(TrackerSleepContext context) {
+
+}
+
+void TrackerLocation::onWake(TrackerSleepContext context) {
+    auto result = evaluatePublish(
+        std::min(TrackerSleep::instance().getConfigConnectingTime(), config_state.interval_min_seconds)
+        );
+
+    if (result.networkNeeded) {
+        enableNetwork();
+        Log.trace("%s needs to start the network", __FUNCTION__);
+    }
+}
+
+void TrackerLocation::onSleepState(TrackerSleepContext context) {
+    if (context.reason == TrackerSleepReason::STATE_TO_CONNECTING) {
+        Log.trace("%s starting GNSS", __FUNCTION__);
+        LocationService::instance().start();
+    }
+}
+
+GnssState TrackerLocation::loopLocation(LocationPoint& cur_loc) {
+    static GnssState lastGnssState = GnssState::OFF;
+    GnssState currentGnssState = GnssState::ON_LOCKED_STABLE;
+
+    LocationStatus locStatus;
+    LocationService::instance().getStatus(locStatus);
+
+    do {
+        if (!locStatus.powered) {
+            currentGnssState = GnssState::OFF;
+            break;
+        }
+
+        if (LocationService::instance().getLocation(cur_loc) != SYSTEM_ERROR_NONE)
+        {
+            currentGnssState = GnssState::ERROR;
+            break;
+        }
+
+        if (!cur_loc.locked) {
+            currentGnssState = GnssState::ON_UNLOCKED;
+            break;
+        }
+
+        if (!cur_loc.stable) {
+            currentGnssState = GnssState::ON_LOCKED_UNSTABLE;
+            break;
+        }
+
+        float radius;
+        LocationService::instance().getRadiusThreshold(radius);
+        if (radius) {
+            bool outside;
+            LocationService::instance().isOutsideRadius(outside, cur_loc);
+            if (outside) {
+                triggerLocPub(Trigger::NORMAL,"radius");
+            }
+        }
+    } while (false);
+
+    // Detect GNSS locked changes
+    if (config_state.lock_trigger &&
+        (currentGnssState == GnssState::ON_LOCKED_STABLE) &&
+        (currentGnssState != lastGnssState)) {
+
+        triggerLocPub(Trigger::NORMAL,"lock");
+    }
+
+    lastGnssState = currentGnssState;
+
+    return currentGnssState;
+}
+
+void TrackerLocation::buildPublish(LocationPoint& cur_loc) {
+    if(cur_loc.locked)
+    {
+        LocationService::instance().setWayPoint(cur_loc.latitude, cur_loc.longitude);
+    }
+
+    CloudService &cloud_service = CloudService::instance();
+    cloud_service.beginCommand("loc");
+    cloud_service.writer().name("loc").beginObject();
+    if (cur_loc.locked)
+    {
+        cloud_service.writer().name("lck").value(1);
+        cloud_service.writer().name("time").value((unsigned int) cur_loc.epochTime);
+        cloud_service.writer().name("lat").value(cur_loc.latitude, 8);
+        cloud_service.writer().name("lon").value(cur_loc.longitude, 8);
+        if(!config_state.min_publish)
+        {
+            cloud_service.writer().name("alt").value(cur_loc.altitude, 3);
+            cloud_service.writer().name("hd").value(cur_loc.heading, 2);
+            cloud_service.writer().name("h_acc").value(cur_loc.horizontalAccuracy, 3);
+            cloud_service.writer().name("v_acc").value(cur_loc.verticalAccuracy, 3);
+        }
+    }
+    else
+    {
+        cloud_service.writer().name("lck").value(0);
+    }
+    for(auto cb : locGenCallbacks)
+    {
+        cb(cloud_service.writer(), cur_loc);
+    }
+    cloud_service.writer().endObject();
+    if(!_pending_triggers.isEmpty())
+    {
+        std::lock_guard<std::recursive_mutex> lg(mutex);
+        cloud_service.writer().name("trig").beginArray();
+        for (auto trigger : _pending_triggers) {
+            cloud_service.writer().value(trigger);
+        }
+        _pending_triggers.clear();
+        cloud_service.writer().endArray();
+    }
+    Log.info("%.*s", cloud_service.writer().dataSize(), cloud_service.writer().buffer());
+}
+
+void TrackerLocation::loop() {
     static system_tick_t last_sample = 0;
-    static int last_loc_locked_pub = 0;
-    static bool first_lock_triggered = false;
 
-    LocationPoint cur_loc;
-
-    //
-    // Detect events and add to pending list to publish
-    //
-
-    // This loop should only sample as fast as necessary
+    // The rest of this loop should only sample as fast as necessary
     if (millis() - last_sample < sample_rate)
     {
         return;
     }
     last_sample = millis();
 
-    if(LocationService::instance().getLocation(cur_loc) != SYSTEM_ERROR_NONE)
+    // First take care of any retry attempts of last loc
+    if (location_publish_retry_str && Particle.connected())
     {
-        return;
+        Log.info("retry failed publish");
+        location_publish();
     }
 
-    float radius;
-    bool outside;
+    // Gather current location information and status
+    LocationPoint cur_loc;
+    auto locationStatus = loopLocation(cur_loc);
 
-    if(cur_loc.locked &&
-        LocationService::instance().getRadiusThreshold(radius) == SYSTEM_ERROR_NONE &&
-        radius &&
-        LocationService::instance().isOutsideRadius(outside, cur_loc) == SYSTEM_ERROR_NONE &&
-        outside)
-    {
-        triggerLocPub(Trigger::NORMAL,"radius");
-    }
-
-    if(cur_loc.locked != last_loc_locked_pub)
-    {
-        if (config_state.lock_trigger || (!first_lock_triggered && cur_loc.locked != 0) )
-        {
-            first_lock_triggered = (first_lock_triggered || cur_loc.locked != 0);
-            triggerLocPub(Trigger::NORMAL,"lock");
-        }
-    }
-
-    //
     // Perform interval evaluation
-    //
-    bool pub_requested = false;
-    if(pending_immediate)
-    {
-        // request for immediate publish overrides the default min/max interval checking
-        pub_requested = true;
-        pending_immediate = false;
+    uint32_t allowance = 0;
+    if (isSleepEnabled()) {
+        allowance = std::min(TrackerSleep::instance().getConfigConnectingTime(), config_state.interval_min_seconds);
     }
-    else if(config_state.interval_max_seconds && System.uptime() - last_location_publish_sec >= (uint32_t) config_state.interval_max_seconds)
-    {
-        // max interval and past the max interval so have to publish
-        triggerLocPub(Trigger::NORMAL,"time");
-        pub_requested = true;
+    auto publishReason = evaluatePublish(allowance);
+
+    // This evaluation may have performed earlier and determined that no network was needed.  Check again
+    // because this loop may overlap with required network operations.
+    if (!TrackerSleep::instance().isFullWakeCycle() && publishReason.networkNeeded) {
+        enableNetwork();
     }
-    else if(!config_state.interval_min_seconds || System.uptime() - last_location_publish_sec >= (uint32_t) config_state.interval_min_seconds)
-    {
-        // no min interval or past the min interval so can publish
-        // check radius and imu triggers
-        if (pending_triggers.size())
-        {
-            pub_requested = true;
+
+    bool publishNow = false;
+
+    //                                   : NONE      TIME        TRIG        IMM
+    //                                    ----------------------------------------
+    // GnssState::OFF                       NA       PUB         PUB         PUB
+    // GnssState::ON_UNLOCKED               NA       WAIT        WAIT        PUB
+    // GnssState::ON_LOCKED_UNSTABLE        NA       WAIT        WAIT        PUB
+    // GnssState::ON_LOCKED_STABLE          NA       PUB         PUB         PUB
+
+    switch (publishReason.reason) {
+        case PublishReason::NONE: {
+            // If there is nothing to do then get out
+            return;
+        }
+
+        case PublishReason::TIME: {
+            switch (locationStatus) {
+                case GnssState::ON_LOCKED_STABLE: {
+                    Log.trace("publishing from max interval");
+                    triggerLocPub(Trigger::NORMAL,"time");
+                    publishNow = true;
+                    break;
+                }
+
+                case GnssState::OFF:
+                // fall through
+                case GnssState::ON_UNLOCKED:
+                // fall through
+                case GnssState::ON_LOCKED_UNSTABLE: {
+                    Log.trace("waiting for stable GNSS lock for max interval");
+                    break;
+                }
+            }
+            break;
+        }
+
+        case PublishReason::TRIGGERS: {
+            switch (locationStatus) {
+                case GnssState::ON_LOCKED_STABLE: {
+                    Log.trace("publishing from triggers");
+                    publishNow = true;
+                    break;
+                }
+
+                case GnssState::OFF:
+                // fall through
+                case GnssState::ON_UNLOCKED:
+                // fall through
+                case GnssState::ON_LOCKED_UNSTABLE: {
+                    Log.trace("waiting for stable GNSS lock for triggers");
+                    break;
+                }
+            }
+            break;
+        }
+
+        case PublishReason::IMMEDIATE: {
+            Log.trace("publishing from immediate");
+            _pending_immediate = false;
+            publishNow = true;
+            break;
         }
     }
 
@@ -351,68 +576,21 @@ void TrackerLocation::loop()
     // Perform publish of location data if requested
     //
 
-    // first any retry attempts of last loc
-    if(location_publish_retry_str && Particle.connected())
-    {
-        location_publish();
-    }
-
     // then of any new publish
-    if(pub_requested)
+    if(publishNow)
     {
         if(location_publish_retry_str)
         {
+            Log.info("freeing unsuccessful retry");
             // retried attempt not completed in time for new publish
             // drop and issue callbacks
             issue_location_publish_callbacks(CloudServiceStatus::TIMEOUT, NULL, location_publish_retry_str);
             free(location_publish_retry_str);
             location_publish_retry_str = nullptr;
         }
-
-        last_location_publish_sec = System.uptime();
-        last_loc_locked_pub = cur_loc.locked;
-        if(cur_loc.locked)
-        {
-            LocationService::instance().setWayPoint(cur_loc.latitude, cur_loc.longitude);
-        }
-
-        CloudService &cloud_service = CloudService::instance();
-        cloud_service.beginCommand("loc");
-        cloud_service.writer().name("loc").beginObject();
-        if (cur_loc.locked)
-        {
-            cloud_service.writer().name("lck").value(1);
-            cloud_service.writer().name("time").value((unsigned int) cur_loc.epochTime);
-            cloud_service.writer().name("lat").value(cur_loc.latitude, 8);
-            cloud_service.writer().name("lon").value(cur_loc.longitude, 8);
-            if(!config_state.min_publish)
-            {
-                cloud_service.writer().name("alt").value(cur_loc.altitude, 3);
-                cloud_service.writer().name("hd").value(cur_loc.heading, 2);
-                cloud_service.writer().name("h_acc").value(cur_loc.horizontalAccuracy, 3);
-                cloud_service.writer().name("v_acc").value(cur_loc.verticalAccuracy, 3);
-            }
-        }
-        else
-        {
-            cloud_service.writer().name("lck").value(0);
-        }
-        for(auto cb : locGenCallbacks)
-        {
-            cb(cloud_service.writer(), cur_loc);
-        }
-        cloud_service.writer().endObject();
-        if(!pending_triggers.isEmpty())
-        {
-            std::lock_guard<std::recursive_mutex> lg(mutex);
-            cloud_service.writer().name("trig").beginArray();
-            for (auto trigger : pending_triggers) {
-                cloud_service.writer().value(trigger);
-            }
-            pending_triggers.clear();
-            cloud_service.writer().endArray();
-        }
-        Log.info("%.*s", cloud_service.writer().dataSize(), cloud_service.writer().buffer());
+        Log.info("publishing now...");
+        _last_location_publish_sec = System.uptime();
+        buildPublish(cur_loc);
 
         pendingLocPubCallbacks = locPubCallbacks;
         locPubCallbacks.clear();

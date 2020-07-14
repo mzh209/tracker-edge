@@ -35,7 +35,7 @@ void ctrl_request_custom_handler(ctrl_request* req)
             result = SYSTEM_ERROR_INVALID_ARGUMENT;
         }
     }
-  
+
     system_ctrl_set_result(req, result, nullptr, nullptr, nullptr);
 }
 
@@ -68,8 +68,111 @@ int Tracker::registerConfig()
     return 0;
 }
 
+uint8_t Tracker::canRead(const uint8_t address)
+{
+    uint8_t value;
+
+    MCP_CAN_SPI_INTERFACE.beginTransaction(__SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(MCP_CAN_CS_PIN, LOW);
+    MCP_CAN_SPI_INTERFACE.transfer(0x03 /*READ*/);
+    MCP_CAN_SPI_INTERFACE.transfer(address);
+    value = MCP_CAN_SPI_INTERFACE.transfer(0);
+    digitalWrite(MCP_CAN_CS_PIN, HIGH);
+    MCP_CAN_SPI_INTERFACE.endTransaction();
+
+    return value;
+}
+
+void Tracker::canModify(const uint8_t address, const uint8_t mask, const uint8_t data)
+{
+    MCP_CAN_SPI_INTERFACE.beginTransaction(__SPISettings(10000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(MCP_CAN_CS_PIN, LOW);
+    MCP_CAN_SPI_INTERFACE.transfer(0x05 /*BIT MODIFY*/);
+    MCP_CAN_SPI_INTERFACE.transfer(address);
+    MCP_CAN_SPI_INTERFACE.transfer(mask);
+    MCP_CAN_SPI_INTERFACE.transfer(data);
+    digitalWrite(MCP_CAN_CS_PIN, HIGH);
+    MCP_CAN_SPI_INTERFACE.endTransaction();
+}
+
+void Tracker::initIo()
+{
+    // Initialize basic Tracker GPIO to known inactive values until they are needed later
+
+    // ESP32 related GPIO
+    pinMode(ESP32_BOOT_MODE_PIN, OUTPUT);
+    digitalWrite(ESP32_BOOT_MODE_PIN, HIGH);
+    pinMode(ESP32_PWR_EN_PIN, OUTPUT);
+    digitalWrite(ESP32_PWR_EN_PIN, LOW); // power off device
+    pinMode(ESP32_CS_PIN, OUTPUT);
+    digitalWrite(ESP32_CS_PIN, HIGH);
+
+    // CAN related GPIO
+    MCP_CAN_SPI_INTERFACE.begin();
+    pinMode(MCP_CAN_STBY_PIN, OUTPUT);
+    digitalWrite(MCP_CAN_STBY_PIN, HIGH);
+    pinMode(MCP_CAN_PWR_EN_PIN, OUTPUT);
+    digitalWrite(MCP_CAN_PWR_EN_PIN, LOW);
+    pinMode(MCP_CAN_RESETN_PIN, OUTPUT);
+    digitalWrite(MCP_CAN_RESETN_PIN, HIGH);
+    pinMode(MCP_CAN_INT_PIN, INPUT_PULLUP);
+    pinMode(MCP_CAN_CS_PIN, OUTPUT);
+    digitalWrite(MCP_CAN_CS_PIN, HIGH);
+
+    // Reset CAN transceiver
+    digitalWrite(MCP_CAN_RESETN_PIN, LOW);
+    delay(50);
+    digitalWrite(MCP_CAN_RESETN_PIN, HIGH);
+    delay(50);
+
+    // Set to standby
+    digitalWrite(MCP_CAN_STBY_PIN, HIGH);
+    digitalWrite(MCP_CAN_PWR_EN_PIN, LOW);
+
+    while ((canRead(0x0e /*CANSTAT*/) & 0xe0 /*OPMOD*/) != 0x20 /*SLEEP*/) {
+        canModify(0x0f /*CANCTRL*/, 0xe0 /*REQOP*/, 0x20 /*SLEEP*/);
+        delay(10);
+    }
+}
+
+void Tracker::enableWatchdog(bool enable) {
+#ifndef RTC_WDT_DISABLE
+    if (enable) {
+        // watchdog at 1 minute
+        rtc.configure_wdt(true, 15, AM1805_WDT_REGISTER_WRB_QUARTER_HZ);
+        rtc.reset_wdt();
+    }
+    else {
+        rtc.disable_wdt();
+    }
+#else
+    (void)enable;
+#endif // RTC_WDT_DISABLE
+}
+
+void Tracker::onSleepPrepare(TrackerSleepContext context)
+{
+    ConfigService::instance().flush();
+}
+
+void Tracker::onSleep(TrackerSleepContext context)
+{
+    if (_model == TRACKER_MODEL_TRACKERONE) {
+        GnssLedEnable(false);
+    }
+}
+
+void Tracker::onWake(TrackerSleepContext context)
+{
+    if (_model == TRACKER_MODEL_TRACKERONE) {
+        GnssLedEnable(true);
+    }
+}
+
 void Tracker::init()
 {
+    int ret = 0;
+
     last_loop_sec = System.uptime();
 
     // mark setup as complete to skip mobile app commissioning flow
@@ -80,7 +183,8 @@ void Tracker::init()
         dct_write_app_data(&val, DCT_SETUP_DONE_OFFSET, DCT_SETUP_DONE_SIZE);
     }
 
-    int ret = hal_get_device_hw_model(&_model, &_variant, nullptr);
+#ifndef TRACKER_MODEL_NUMBER
+    ret = hal_get_device_hw_model(&_model, &_variant, nullptr);
     if (ret)
     {
         Log.error("Failed to read device model and variant");
@@ -89,13 +193,27 @@ void Tracker::init()
     {
         Log.info("Tracker model = %04lX, variant = %04lX", _model, _variant);
     }
+#else
+    _model = TRACKER_MODEL_NUMBER;
+#ifdef TRACKER_MODEL_VARIANT
+    _variant = TRACKER_MODEL_VARIANT;
+#else
+    _variant = 0;
+#endif // TRACKER_MODEL_VARIANT
+#endif // TRACKER_MODEL_NUMBER
 
-    // PIN_INVALID to disable unnecessary config of a default CS pin
-    SPI.begin(PIN_INVALID);
+    // Initialize unused interfaces and pins
+    initIo();
 
     CloudService::instance().init();
 
     ConfigService::instance().init();
+
+    TrackerSleep::instance().init([this](bool enable){ this->enableWatchdog(enable); });
+    TrackerSleep::instance().registerSleepPrepare([this](TrackerSleepContext context){ this->onSleepPrepare(context); });
+    TrackerSleep::instance().registerSleep([this](TrackerSleepContext context){ this->onSleep(context); });
+    TrackerSleep::instance().registerWake([this](TrackerSleepContext context){ this->onWake(context); });
+
 
     // Register our own configuration settings
     registerConfig();
@@ -109,8 +227,6 @@ void Tracker::init()
     {
         Log.error("Failed to begin location service");
     }
-
-    LocationService::instance().start();
 
     // Check for Tracker One hardware
     if (_model == TRACKER_MODEL_TRACKERONE)
@@ -131,12 +247,7 @@ void Tracker::init()
     rgb.init();
 
     rtc.begin();
-#ifdef RTC_WDT_DISABLE
-    rtc.disable_wdt();
-#else
-    // watchdog at 1 minute
-    rtc.configure_wdt(true, 15, AM1805_WDT_REGISTER_WRB_QUARTER_HZ);
-#endif
+    enableWatchdog(true);
 
     location.regLocGenCallback(loc_gen_cb);
 }
@@ -150,14 +261,13 @@ void Tracker::loop()
     {
         last_loop_sec = cur_sec;
 
-        #ifndef RTC_WDT_DISABLE
-            wdt_rtc->reset_wdt();
-        #endif
+#ifndef RTC_WDT_DISABLE
+        rtc.reset_wdt();
+#endif
     }
 
     // fast operations for every loop
-    CloudService::instance().tick();
-    ConfigService::instance().tick();
+    TrackerSleep::instance().loop();
     TrackerMotion::instance().loop();
 
     // Check for Tracker One hardware
@@ -176,6 +286,10 @@ void Tracker::loop()
         }
     }
 
+
+    // fast operations for every loop
+    CloudService::instance().tick();
+    ConfigService::instance().tick();
     location.loop();
 }
 
