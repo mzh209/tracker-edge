@@ -278,6 +278,7 @@ TrackerSleepResult TrackerSleep::sleep() {
   Log.info("sleeping until %lu milliseconds", (uint32_t)(now + duration));
 
   config.mode(SystemSleepMode::ULTRA_LOW_POWER)
+    .gpio(PMIC_INT, FALLING) // TODO!!!! remove me
     .duration(duration);
 
   // Accumulate all of the pin sources for wake

@@ -495,12 +495,51 @@ void TrackerLocation::loop() {
     LocationPoint cur_loc;
     auto locationStatus = loopLocation(cur_loc);
 
+    // TODO!!! Delete this
+    switch (locationStatus) {
+        case GnssState::OFF: {
+            Log.trace("GNSS off");
+            break;
+        }
+
+        case GnssState::ON_LOCKED_STABLE: {
+            Log.trace("GNSS stable");
+            break;
+        }
+
+        case GnssState::ON_UNLOCKED: {
+            Log.trace("GNSS unlocked");
+            break;
+        }
+
+        case GnssState::ON_LOCKED_UNSTABLE: {
+            Log.trace("GNSS stablizing");
+            break;
+        }
+    }
+
     // Perform interval evaluation
     uint32_t allowance = 0;
     if (isSleepEnabled()) {
         allowance = std::min(TrackerSleep::instance().getConfigConnectingTime(), config_state.interval_min_seconds);
     }
     auto publishReason = evaluatePublish(allowance);
+
+    // TODO!!! delete me
+    if (TrackerSleep::instance().isFullWakeCycle()) {
+        Log.trace("currently in full wake");
+    }
+    else {
+        Log.trace("currently NOT in full wake");
+    }
+
+    // TODO!!! delete me
+    if (publishReason.networkNeeded) {
+        Log.trace("need the network");
+    }
+    else {
+        Log.trace("don't need the network");
+    }
 
     // This evaluation may have performed earlier and determined that no network was needed.  Check again
     // because this loop may overlap with required network operations.
