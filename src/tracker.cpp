@@ -79,6 +79,10 @@ void Tracker::initIo()
     pinMode(ESP32_BOOT_MODE_PIN, OUTPUT);
     digitalWrite(ESP32_BOOT_MODE_PIN, HIGH);
     pinMode(ESP32_PWR_EN_PIN, OUTPUT);
+    digitalWrite(ESP32_PWR_EN_PIN, LOW); // power off device, first power off for ESP32 workaround for low power
+    delay(50); // ESP32 workaround for low power
+    digitalWrite(ESP32_PWR_EN_PIN, HIGH); // power on device, ESP32 workaround for low power
+    delay(50); // ESP32 workaround for low power
     digitalWrite(ESP32_PWR_EN_PIN, LOW); // power off device
     pinMode(ESP32_CS_PIN, OUTPUT);
     digitalWrite(ESP32_CS_PIN, HIGH);
