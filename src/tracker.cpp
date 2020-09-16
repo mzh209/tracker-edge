@@ -18,7 +18,10 @@
 
 #include "tracker.h"
 #include "tracker_cellular.h"
+#include "mcp_can.h"
 
+// Defines and constants
+constexpr int CAN_SLEEP_RETRIES = 10; // Based on a series of 10ms delays
 
 void ctrl_request_custom_handler(ctrl_request* req)
 {
@@ -68,33 +71,6 @@ int Tracker::registerConfig()
     return 0;
 }
 
-uint8_t Tracker::canRead(const uint8_t address)
-{
-    uint8_t value;
-
-    MCP_CAN_SPI_INTERFACE.beginTransaction(__SPISettings(10000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(MCP_CAN_CS_PIN, LOW);
-    MCP_CAN_SPI_INTERFACE.transfer(0x03 /*READ*/);
-    MCP_CAN_SPI_INTERFACE.transfer(address);
-    value = MCP_CAN_SPI_INTERFACE.transfer(0);
-    digitalWrite(MCP_CAN_CS_PIN, HIGH);
-    MCP_CAN_SPI_INTERFACE.endTransaction();
-
-    return value;
-}
-
-void Tracker::canModify(const uint8_t address, const uint8_t mask, const uint8_t data)
-{
-    MCP_CAN_SPI_INTERFACE.beginTransaction(__SPISettings(10000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(MCP_CAN_CS_PIN, LOW);
-    MCP_CAN_SPI_INTERFACE.transfer(0x05 /*BIT MODIFY*/);
-    MCP_CAN_SPI_INTERFACE.transfer(address);
-    MCP_CAN_SPI_INTERFACE.transfer(mask);
-    MCP_CAN_SPI_INTERFACE.transfer(data);
-    digitalWrite(MCP_CAN_CS_PIN, HIGH);
-    MCP_CAN_SPI_INTERFACE.endTransaction();
-}
-
 void Tracker::initIo()
 {
     // Initialize basic Tracker GPIO to known inactive values until they are needed later
@@ -108,11 +84,10 @@ void Tracker::initIo()
     digitalWrite(ESP32_CS_PIN, HIGH);
 
     // CAN related GPIO
-    MCP_CAN_SPI_INTERFACE.begin();
     pinMode(MCP_CAN_STBY_PIN, OUTPUT);
-    digitalWrite(MCP_CAN_STBY_PIN, HIGH);
+    digitalWrite(MCP_CAN_STBY_PIN, LOW);
     pinMode(MCP_CAN_PWR_EN_PIN, OUTPUT);
-    digitalWrite(MCP_CAN_PWR_EN_PIN, LOW);
+    digitalWrite(MCP_CAN_PWR_EN_PIN, HIGH); // The CAN 5V power supply will be enabled for a short period
     pinMode(MCP_CAN_RESETN_PIN, OUTPUT);
     digitalWrite(MCP_CAN_RESETN_PIN, HIGH);
     pinMode(MCP_CAN_INT_PIN, INPUT_PULLUP);
@@ -125,12 +100,35 @@ void Tracker::initIo()
     digitalWrite(MCP_CAN_RESETN_PIN, HIGH);
     delay(50);
 
+    // Initialize CAN device driver
+    MCP_CAN can(MCP_CAN_CS_PIN, MCP_CAN_SPI_INTERFACE);
+    if (can.begin(MCP_RX_ANY, CAN_1000KBPS, MCP_20MHZ) != CAN_OK)
+    {
+        Log.error("CAN init failed");
+    }
+    Log.info("CAN status: 0x%x", can.getCANStatus());
+    if (can.setMode(MODE_NORMAL)) {
+        Log.error("CAN mode to NORMAL failed");
+    }
+    else {
+        Log.info("CAN mode to NORMAL");
+    }
+    delay(500);
+
     // Set to standby
     digitalWrite(MCP_CAN_STBY_PIN, HIGH);
-    digitalWrite(MCP_CAN_PWR_EN_PIN, LOW);
+    digitalWrite(MCP_CAN_PWR_EN_PIN, LOW); // The CAN 5V power supply will now be disabled
 
-    while ((canRead(0x0e /*CANSTAT*/) & 0xe0 /*OPMOD*/) != 0x20 /*SLEEP*/) {
-        canModify(0x0f /*CANCTRL*/, 0xe0 /*REQOP*/, 0x20 /*SLEEP*/);
+    for (int retries = CAN_SLEEP_RETRIES; retries >= 0; retries--) {
+        auto stat = can.getCANStatus() & MODE_MASK;
+        if (stat == MODE_SLEEP) {
+            Log.info("CAN mode to SLEEP");
+            break;
+        }
+        // Retry setting the sleep mode
+        if (can.setMode(MODE_SLEEP)) {
+            Log.error("CAN mode not set to SLEEP");
+        }
         delay(10);
     }
 }

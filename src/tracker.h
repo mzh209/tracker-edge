@@ -34,6 +34,7 @@
 #include "tracker_rgb.h"
 #include "gnss_led.h"
 #include "temperature.h"
+#include "mcp_can.h"
 
 struct TrackerConfig
 {
@@ -88,8 +89,6 @@ class Tracker
 
         uint32_t last_loop_sec;
 
-        uint8_t canRead(const uint8_t address);
-        void canModify(const uint8_t address, const uint8_t mask, const uint8_t data);
         void initIo();
         void onSleepPrepare(TrackerSleepContext context);
         void onSleep(TrackerSleepContext context);
